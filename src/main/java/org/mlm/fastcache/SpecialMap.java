@@ -1,7 +1,4 @@
-package org.mlm.fastcache.util;
-
-import org.mlm.fastcache.Element;
-import org.mlm.fastcache.EvictionMode;
+package org.mlm.fastcache;
 
 import java.io.IOException;
 import java.io.Serializable;

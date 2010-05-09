@@ -1,9 +1,6 @@
 package org.mlm.fastcache;
 
-import org.mlm.fastcache.util.SpecialMap;
-
 import java.util.HashSet;
-import java.util.LinkedList;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -21,15 +18,23 @@ public class CacheImpl<K,V> implements Cache<K,V>
     DiskStore diskStore;
     long liveTime;
     EvictionMode evictionMode;
+    private boolean replicatePuts = false;
+    private boolean replicatePutsViaEvict = false;
+    private boolean replicateUpdates = false;
+    private boolean replicateUpdatesViaEvict = false;
+    private boolean replicateEvicts = false;
 
-    public CacheImpl(int maxSize)
+    public CacheImpl(int maxSize, EvictionMode em)
     {
-        map = new SpecialMap<K, Element<K, V>>(maxSize)
+        map = new SpecialMap<K, Element<K, V>>(maxSize, em)
         {
             @Override
             public void evict(SpecialMap.HashEntry<K, Element<K, V>> el)
             {
-                // TODO evict
+                if (diskStore != null)
+                {
+                    diskStore.enqueue(el.value);
+                }
                 super.evict(el);
             }
         };
@@ -105,16 +110,16 @@ public class CacheImpl<K,V> implements Cache<K,V>
     {
         synchronized (readd)
         {
+            long now = System.currentTimeMillis();
             for (Element<K,V> el : readd)
             {
-                if (el.isExpired())
+                if (el.isExpired(now))
                 {
                     // drop
                 } else
                 {
-
+                    map.putIfAbsent(el.getKey(), el);
                 }
-
             }
             readd.clear();
         }
@@ -137,11 +142,33 @@ public class CacheImpl<K,V> implements Cache<K,V>
     {
         evictionMode.insertElement(el, liveTime);
         map.put(el.getKey(), el);
+        if (replicatePuts)
+        {
+            if (replicatePutsViaEvict)
+            {
+                // TODO
+            } else
+            {
+                // TODO
+            }
+        }
     }
 
     public void update(Element<K,V> el)
     {
-        
+        // retain previous statistics.
+        evictionMode.insertElement(el, liveTime);
+        map.put(el.getKey(), el);
+        if (replicateUpdates)
+        {
+            if (replicateUpdatesViaEvict)
+            {
+                // TODO
+            } else
+            {
+                // TODO
+            }
+        }
     }
 
     @Override
@@ -152,12 +179,52 @@ public class CacheImpl<K,V> implements Cache<K,V>
         {
             diskStore.evict(key);
         }
+        if (replicateEvicts)
+        {
+            // TODO
+        }
     }
 
     @Override
     public void flushAll()
     {
         map.clear();
-        diskStore.flushAll();
+        if (diskStore != null)
+        {
+            diskStore.flushAll();
+        }
+        if (replicateEvicts)
+        {
+            // TODO
+        }
+    }
+
+    public void onEvict(K key)
+    {
+        map.remove(key);
+        if (diskStore != null)
+        {
+            diskStore.evict(key);
+        }
+    }
+    public void onFlushAll()
+    {
+        map.clear();
+        if (diskStore != null)
+        {
+            diskStore.flushAll();
+        }
+    }
+
+    public void onPut(Element<K,V> el)
+    {
+        evictionMode.insertElement(el, liveTime);
+        map.put(el.getKey(), el);
+    }
+
+    public void onUpdate(Element<K,V> el)
+    {
+        evictionMode.insertElement(el, liveTime);
+        map.put(el.getKey(), el);
     }
 }

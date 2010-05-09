@@ -1,13 +1,9 @@
 package org.mlm.fastcache;
 
-import org.mlm.fastcache.util.SpecialMap;
-
 import java.io.*;
-import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
