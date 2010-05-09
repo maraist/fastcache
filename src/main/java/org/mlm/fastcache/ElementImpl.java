@@ -10,7 +10,8 @@ public class ElementImpl<K, V> implements Element<K, V>
     V value;
     long createTS;
     long lastUsedTS;
-    long expireTS;
+    long expireTS = Long.MAX_VALUE;
+    long softExpireTS = Long.MAX_VALUE;
     int usageCount;
     int hash;
     private int version;
@@ -20,8 +21,15 @@ public class ElementImpl<K, V> implements Element<K, V>
     {
         this.key = key;
         this.hash = key == null ? 0 : key.hashCode();
+        this.hash += version;
         this.value = value;
         this.createTS = ts;
+    }
+
+    private void computeHash()
+    {
+        this.hash = key == null ? 0 : key.hashCode();
+        this.hash += version;
     }
 
     public K getKey()
@@ -32,6 +40,7 @@ public class ElementImpl<K, V> implements Element<K, V>
     public void setKey(K key)
     {
         this.key = key;
+        computeHash();
     }
 
     public V getValue()
@@ -49,6 +58,7 @@ public class ElementImpl<K, V> implements Element<K, V>
     public void setVersion(int v)
     {
         this.version = v;
+        computeHash();
     }
 
     public void setValue(V value)
@@ -86,6 +96,16 @@ public class ElementImpl<K, V> implements Element<K, V>
         this.expireTS = expireTS;
     }
 
+    public long getSoftExpireTS()
+    {
+        return softExpireTS;
+    }
+
+    public void setSoftExpireTS(long softExpireTS)
+    {
+        this.softExpireTS = softExpireTS;
+    }
+
     public int getUsageCount()
     {
         return usageCount;
@@ -94,6 +114,64 @@ public class ElementImpl<K, V> implements Element<K, V>
     public void setUsageCount(int usageCount)
     {
         this.usageCount = usageCount;
+    }
+
+    @Override
+    public boolean isSoftExpired(long now)
+    {
+        long ets = softExpireTS;
+        if (ets != Long.MAX_VALUE && ets < now)
+        {
+            return true;
+        } else
+        {
+            return isExpired(now);
+        }
+    }
+
+    public boolean isSoftExpired()
+    {
+        long ets = softExpireTS;
+        if (ets != Long.MAX_VALUE)
+        {
+            long now = System.currentTimeMillis();
+            if (ets < now)
+            {
+                return true;
+            } else
+            {
+                return isExpired(now);
+            }
+        } else
+        {
+            return isExpired();
+        }
+    }
+
+    /**
+     * Avoids calling system-time, and allows unit-testing
+     * @param now
+     * @return
+     */
+    @Override
+    public boolean isExpired(long now)
+    {
+        long ets = expireTS;
+        if (ets != Long.MAX_VALUE && ets < now)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    public boolean isExpired()
+    {
+        long ets = expireTS;
+        if (ets != Long.MAX_VALUE && ets < System.currentTimeMillis())
+        {
+            return true;
+        }
+        return false;
     }
 
     @Override
@@ -120,6 +198,10 @@ public class ElementImpl<K, V> implements Element<K, V>
             return false;
         }
         if (key != null ? !key.equals(element.key) : element.key != null)
+        {
+            return false;
+        }
+        if (version != element.version)
         {
             return false;
         }

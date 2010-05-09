@@ -2,8 +2,11 @@ package org.mlm.fastcache;
 
 import org.mlm.fastcache.util.SpecialMap;
 
+import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Date: May 8, 2010
@@ -12,17 +15,22 @@ import java.util.concurrent.ScheduledExecutorService;
 public class CacheImpl<K,V> implements Cache<K,V>
 {
     SpecialMap<K,Element<K,V>> map;
-    LinkedList<Element<K,V>> expired = new LinkedList<Element<K,V>>();
+    Set<Element<K,V>> expired = new HashSet<Element<K,V>>();
+    Set<Element<K,V>> readd = new HashSet<Element<K,V>>();
     ScheduledExecutorService executor;
+    DiskStore diskStore;
+    long liveTime;
+    EvictionMode evictionMode;
 
     public CacheImpl(int maxSize)
     {
         map = new SpecialMap<K, Element<K, V>>(maxSize)
         {
             @Override
-            public void evict(SpecialMap.HashEntry<K, Element<K, V>> max)
+            public void evict(SpecialMap.HashEntry<K, Element<K, V>> el)
             {
                 // TODO evict
+                super.evict(el);
             }
         };
     }
@@ -30,55 +38,126 @@ public class CacheImpl<K,V> implements Cache<K,V>
     @Override
     public Element<K,V> get(K key)
     {
-        Element<K,V> res;
-        res = map.get(key);
-        if (res != null)
+        Element<K,V> el;
+        el = map.get(key);
+        if (el != null)
         {
-            if (res.getExpireTS() < System.currentTimeMillis())
+            if (el.isExpired())
             {
-                synchronized (expired)
-                {
-                    expired.add(res);
-                    if (expired.size() == 1)
-                    {
-                        executor.execute(new Runnable()
-                        {
-                            @Override
-                            public void run()
-                            {
-                                synchronized (expired)
-                                {
-                                    for (Element<K,V> el : expired)
-                                    {
-                                        map.remove(el.getKey(), el);
-                                    }
-                                }
-
-                            }
-                        });
-                    }
-                }
-                return null; // expired, just leave it
+                expireMessageOnGet(el);
+                return null;
+            }
+            evictionMode.useElement(el);
+            return el;
+        }
+        if (diskStore != null)
+        {
+            el = diskStore.get(key);
+            if (el != null)
+            {
+                // we assume expiration is already tested
+                evictionMode.useElement(el);
+                readdMessageOnGet(el);
             }
         }
-        return null;  //To change body of implemented methods use File | Settings | File Templates.
+        return el;
+    }
+
+    private void readdMessageOnGet(Element<K, V> el)
+    {
+        synchronized (readd)
+        {
+            readd.add(el);
+            if (readd.size() == 1)
+            {
+                executor.schedule(new Runnable()
+                {
+                    @Override
+                    public void run()
+                    {
+                        readdMessages();
+                    }
+                }, 100, TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    private void expireMessageOnGet(Element<K, V> el)
+    {
+        synchronized (expired)
+        {
+            expired.add(el);
+            if (expired.size() == 1)
+            {
+                executor.schedule(new Runnable()
+                {
+                    @Override
+                    public void run()
+                    {
+                        expireMessages();
+                    }
+                }, 100, TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    private void readdMessages()
+    {
+        synchronized (readd)
+        {
+            for (Element<K,V> el : readd)
+            {
+                if (el.isExpired())
+                {
+                    // drop
+                } else
+                {
+
+                }
+
+            }
+            readd.clear();
+        }
+    }
+
+    private void expireMessages()
+    {
+        synchronized (expired)
+        {
+            for (Element<K,V> el : expired)
+            {
+                map.remove(el.getKey(), el); // if it's changed, ignore
+            }
+            expired.clear();
+        }
     }
 
     @Override
-    public void put(Element el)
+    public void put(Element<K,V> el)
     {
-        //To change body of implemented methods use File | Settings | File Templates.
+        evictionMode.insertElement(el, liveTime);
+        map.put(el.getKey(), el);
+    }
+
+    public void update(Element<K,V> el)
+    {
+        
     }
 
     @Override
-    public void evict(Object key)
+    public void evict(K key)
     {
-        //To change body of implemented methods use File | Settings | File Templates.
+        map.remove(key);
+        if (diskStore != null)
+        {
+            diskStore.evict(key);
+        }
     }
 
     @Override
     public void flushAll()
     {
-        //To change body of implemented methods use File | Settings | File Templates.
+        map.clear();
+        diskStore.flushAll();
     }
 }

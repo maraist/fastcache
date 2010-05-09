@@ -6,6 +6,7 @@ import java.io.*;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -19,8 +20,8 @@ public class DiskStore<K,V>
     final TreeMap<Integer,DiskRecord> freeMap = new TreeMap<Integer, DiskRecord>();
     final SpecialMap<K, Element<K,V>> smallMap;
 
-    final LinkedHashMap<Element<K,V>, DiskRecord> diskMap = new LinkedHashMap<Element<K,V>, DiskRecord>();
-    final LinkedHashMap<Element<K,V>,Element<K,V>> enqueueMap = new LinkedHashMap<Element<K,V>,Element<K,V>>();
+    final SpecialMap<K, DiskRecord> diskMap;
+    final ConcurrentHashMap<K,Element<K,V>> enqueueMap;
 
     final DiskRecord maxRecord = new DiskRecord(0, 0, Integer.MAX_VALUE, 0);
     private int maxRecords;
@@ -28,6 +29,16 @@ public class DiskStore<K,V>
     RandomAccessFile raf;
     private String cacheName;
     long endOfFilePos = 0;
+
+    public void evict(K key)
+    {
+        //To change body of created methods use File | Settings | File Templates.
+    }
+
+    public void flushAll()
+    {
+        //To change body of created methods use File | Settings | File Templates.
+    }
 
     class DiskRecord
     {
@@ -51,6 +62,16 @@ public class DiskStore<K,V>
     {
         freeMap.put(Integer.MAX_VALUE, maxRecord);
         this.smallMap = new SpecialMap<K, Element<K, V>>(maxRecords);
+        this.diskMap  = new SpecialMap<K, DiskRecord>(maxRecords)
+        {
+            @Override
+            public void evict(SpecialMap.HashEntry<K, DiskRecord> el)
+            {
+                // TODO evict
+                super.evict(el);
+            }
+        };
+        this.enqueueMap = new SpecialMap<K, Element<K, V>>(maxRecords);
         this.cacheName = cacheName;
         raf = new RandomAccessFile(cacheName, "rw"); // TODO put in correct directory
         this.executor = executor;

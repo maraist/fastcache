@@ -19,4 +19,10 @@ public interface Element<K,V> {
     void setExpireTS(long ts);
     int getUsageCount();
     void incrementUsage();
+    void setUsageCount(int c);
+
+    boolean isSoftExpired();
+    boolean isExpired();
+    boolean isExpired(long now);
+    boolean isSoftExpired(long now);
 }
