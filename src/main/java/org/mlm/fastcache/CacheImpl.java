@@ -1,5 +1,6 @@
 package org.mlm.fastcache;
 
+import java.lang.ref.Reference;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
@@ -11,7 +12,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class CacheImpl<K,V> implements Cache<K,V>
 {
-    SpecialMap<K,Element<K,V>> map;
+    SpecialMap<K, Element<K,V>> map;
     Set<Element<K,V>> expired = new HashSet<Element<K,V>>();
     Set<Element<K,V>> readd = new HashSet<Element<K,V>>();
     ScheduledExecutorService executor;
@@ -47,22 +48,30 @@ public class CacheImpl<K,V> implements Cache<K,V>
         el = map.get(key);
         if (el != null)
         {
-            if (el.isExpired())
+            synchronized (el)
             {
-                expireMessageOnGet(el);
-                return null;
+                if (el.isExpired())
+                {
+                    expireMessageOnGet(el);
+                    return null;
+                }
+                evictionMode.useElement(el);
             }
-            evictionMode.useElement(el);
             return el;
-        }
-        if (diskStore != null)
+        } else if (diskStore != null)
         {
             el = diskStore.get(key);
             if (el != null)
             {
-                // we assume expiration is already tested
-                evictionMode.useElement(el);
-                readdMessageOnGet(el);
+                synchronized (el)
+                {
+                    if (el.isExpired())
+                    {
+                        expireMessageOnGet(el);
+                        return null;
+                    }
+                    evictionMode.useElement(el);
+                }
             }
         }
         return el;

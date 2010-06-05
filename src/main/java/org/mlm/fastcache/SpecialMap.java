@@ -3,7 +3,9 @@ package org.mlm.fastcache;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Date: May 8, 2010
@@ -104,7 +106,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      * @param hash the hash code for the key
      * @return the segment
      */
-    final Segment<K, V> segmentFor(int hash)
+    final Segment segmentFor(int hash)
     {
         return segments[(hash >>> segmentShift) & segmentMask];
     }
@@ -146,7 +148,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
     }
 
     @SuppressWarnings("unchecked")
-    final static <K, V> Segment<K, V>[] newArray(int i)
+    final static  Segment[] newArray(int i)
     {
         return new Segment[i];
     }
@@ -156,8 +158,11 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      * subclasses from ReentrantLock opportunistically, just to
      * simplify some locking and avoid separate construction.
      */
-    final class Segment extends ReentrantLock implements Serializable
+    final class Segment extends ReentrantReadWriteLock implements Serializable
     {
+        AtomicInteger internalCount = new AtomicInteger(0);
+        AtomicInteger externalCount = new AtomicInteger(0);
+        Lock[] locks;
         Random r = new Random();
         /*
          * Segments maintain a table of entry lists that are ALWAYS
@@ -197,13 +202,14 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
          */
 
         private int maxSize = 0;
+        private int maxSizeThreshold = 0;
 
         private static final long serialVersionUID = 2249069246763182397L;
 
         /**
          * The number of elements in this segment's region.
          */
-        transient volatile int count;
+//        transient volatile int count;
 
         /**
          * Number of updates that alter the size of the table. This is
@@ -236,11 +242,42 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
          */
         final float loadFactor;
 
+        private int lockShift;
+        private int lockMask;
+
         Segment(int initialCapacity, float lf, int maxSize)
         {
+            initializeLocks(initialCapacity);
             this.maxSize = maxSize;
+            this.maxSizeThreshold = maxSize - 16;
             loadFactor = lf;
             setTable(HashEntry.<K, V>newArray(initialCapacity));
+        }
+
+        private void initializeLocks(int size)
+        {
+            int lsize = Math.min(size, 2048);
+            if (locks != null && locks.length == lsize)
+            {
+                // no point in rebuilding locks if we've maxed out already
+                return;
+            }
+            int sshift = 0;
+            int ssize = 1;
+            while (ssize < lsize)
+            {
+                ++sshift;
+                ssize <<= 1;
+            }
+
+            lockShift = 32 - sshift;
+            lockMask = ssize - 1;
+            locks = new Lock[ssize];
+        }
+
+        private Lock lockFor(int hash)
+        {
+            return locks[(hash >>> lockShift) & lockMask];
         }
 
 
@@ -272,13 +309,15 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
          */
         V readValueUnderLock(HashEntry<K, V> e)
         {
-            lock();
+            Lock outerLock = writeLock();
+            outerLock.lock();
             try
             {
                 return e.value;
             } finally
             {
-                unlock();
+
+                outerLock.unlock();
             }
         }
 
@@ -286,7 +325,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
 
         V get(Object key, int hash)
         {
-            if (count != 0)
+            if (externalCount.get() != 0)
             { // read-volatile
                 HashEntry<K, V> e = getFirst(hash);
                 while (e != null)
@@ -308,7 +347,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
 
         boolean containsKey(Object key, int hash)
         {
-            if (count != 0)
+            if (externalCount.get() != 0)
             { // read-volatile
                 HashEntry<K, V> e = getFirst(hash);
                 while (e != null)
@@ -325,7 +364,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
 
         boolean containsValue(Object value)
         {
-            if (count != 0)
+            if (externalCount.get() != 0)
             { // read-volatile
                 HashEntry<K, V>[] tab = table;
                 int len = tab.length;
@@ -350,103 +389,160 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
 
         boolean replace(K key, int hash, V oldValue, V newValue)
         {
-            lock();
+            Lock outerLock = readLock();
+            outerLock.lock();
             try
             {
-                HashEntry<K, V> e = getFirst(hash);
-                while (e != null && (e.hash != hash || !key.equals(e.key)))
+                Lock innerLock = lockFor(hash);
+                innerLock.lock();
+                try
                 {
-                    e = e.next;
-                }
+                    HashEntry<K, V> e = getFirst(hash);
+                    while (e != null && (e.hash != hash || !key.equals(e.key)))
+                    {
+                        e = e.next;
+                    }
 
-                boolean replaced = false;
-                if (e != null && oldValue.equals(e.value))
+                    boolean replaced = false;
+                    if (e != null && oldValue.equals(e.value))
+                    {
+                        replaced = true;
+                        e.value = newValue;
+                    }
+                    return replaced;
+                } finally
                 {
-                    replaced = true;
-                    e.value = newValue;
+                    innerLock.unlock();
                 }
-                return replaced;
             } finally
             {
-                unlock();
+                outerLock.unlock();
             }
         }
 
         V replace(K key, int hash, V newValue)
         {
-            lock();
+            Lock outerLock = readLock();
+            outerLock.lock();
             try
             {
-                HashEntry<K, V> e = getFirst(hash);
-                while (e != null && (e.hash != hash || !key.equals(e.key)))
+                Lock innerLock = lockFor(hash);
+                innerLock.lock();
+                try
                 {
-                    e = e.next;
-                }
+                    HashEntry<K, V> e = getFirst(hash);
+                    while (e != null && (e.hash != hash || !key.equals(e.key)))
+                    {
+                        e = e.next;
+                    }
 
-                V oldValue = null;
-                if (e != null)
+                    V oldValue = null;
+                    if (e != null)
+                    {
+                        oldValue = e.value;
+                        e.value = newValue;
+                    }
+                    return oldValue;
+                } finally
                 {
-                    oldValue = e.value;
-                    e.value = newValue;
+                    innerLock.unlock();
                 }
-                return oldValue;
             } finally
             {
-                unlock();
+                outerLock.unlock();
             }
         }
 
 
         V put(K key, int hash, V value, boolean onlyIfAbsent)
         {
-            lock();
+            int potentialSize = internalCount.incrementAndGet();
+            Lock outerLock;
+            boolean couldResize = false;
+            boolean couldExpire = false;
+            if (potentialSize >= threshold || potentialSize > maxSizeThreshold)
+            {
+                if (potentialSize >= threshold)
+                {
+                    couldResize = true;
+                }
+                if (potentialSize > maxSizeThreshold)
+                {
+                    couldExpire = true;
+                }
+                // might cause a growth, so we need a write-lock;
+                outerLock = writeLock();
+            } else
+            {
+                // we're safe, even if it grows too big, someone else is responsible for resizing.
+                outerLock = readLock();
+            }
+            outerLock.lock();
             try
             {
-                int c = count;
-                if (c++ > threshold && c < maxSize) // ensure capacity
+                Lock innerLock = lockFor(hash);
+                innerLock.lock();
+                try
                 {
-                    rehash();
-                }
-                HashEntry<K, V>[] tab = table;
-                int index = hash & (tab.length - 1);
-                HashEntry<K, V> first = tab[index];
-                HashEntry<K, V> e = first;
-                while (e != null && (e.hash != hash || !key.equals(e.key)))
-                {
-                    e = e.next;
-                }
-
-                V oldValue;
-                if (e != null)
-                {
-                    oldValue = e.value;
-                    if (!onlyIfAbsent)
+                    if (couldResize)
                     {
-                        e.value = value;
-                    }
-                } else
-                {
-                    oldValue = null;
-                    // Note, we make a value-judgement that if the map isn't dense enough, we'll allow
-                    // continued population
-                    // We also decide that if our bank is relatively under-populationed, we'll continue to
-                    // grow.  This puts extra pressure on A) banks that are extra-large, and B) chains that are long
-                    if (first != null && c >= maxSize && SpecialMap.this.isFull())
-                    {
-                        e = randomlySampleOldest(first, System.currentTimeMillis());
-                        if (e != null)
+                        // we have the lock, so it's safe to test
+                        int c = externalCount.get();
+                        if (c > threshold && c < maxSize)
                         {
-                            SpecialMap.this.evict(e);
+                            rehash();
                         }
                     }
-                    ++modCount;
-                    tab[index] = new HashEntry<K, V>(key, hash, first, value);
-                    count = c; // write-volatile
+                    HashEntry<K, V>[] tab = table;
+                    int index = hash & (tab.length - 1);
+                    HashEntry<K, V> first = tab[index];
+                    HashEntry<K, V> e = first;
+                    while (e != null && (e.hash != hash || !key.equals(e.key)))
+                    {
+                        e = e.next;
+                    }
+
+                    V oldValue;
+                    if (e != null)
+                    {
+                        // We're replacing an existing item, so no growth.
+                        oldValue = e.value;
+                        if (!onlyIfAbsent)
+                        {
+                            e.value = value;
+                        }
+                        internalCount.decrementAndGet(); // we didn't actually add anything
+                    } else
+                    {
+                        oldValue = null;
+                        // Note, we make a value-judgement that if the map isn't dense enough, we'll allow
+                        // continued population
+                        // We also decide that if our bank is relatively under-populationed, we'll continue to
+                        // grow.  This puts extra pressure on A) banks that are extra-large, and B) chains that are long
+                        if (couldExpire && first != null)
+                        {
+                            int c = externalCount.get();
+                            if (c >= maxSize && SpecialMap.this.isFull())
+                            {
+                                e = randomlySampleOldest(first, System.currentTimeMillis());
+                                if (e != null)
+                                {
+                                    SpecialMap.this.evict(e);
+                                }
+                            }
+                        }
+                        ++modCount;
+                        tab[index] = new HashEntry<K, V>(key, hash, first, value);
+                        externalCount.incrementAndGet();
+                    }
+                    return oldValue;
+                } finally
+                {
+                    innerLock.unlock();
                 }
-                return oldValue;
             } finally
             {
-                unlock();
+                outerLock.unlock();
             }
         }
 
@@ -455,9 +551,6 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
          * <p/>
          * assumes that if best is null, bestTS is max-int
          *
-         * @param best
-         * @param bestTS
-         * @return
          */
         private HashEntry<K, V> randomlySampleOldest(HashEntry<K, V> es, long now)
         {
@@ -501,6 +594,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
                     }
                 }
             }
+
             return best;
         }
 
@@ -528,6 +622,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
              */
 
             HashEntry<K, V>[] newTable = HashEntry.newArray(oldCapacity << 1);
+            initializeLocks(newTable.length);
             threshold = (int) (newTable.length * loadFactor);
             int sizeMask = newTable.length - 1;
             for (int i = 0; i < oldCapacity; i++)
@@ -582,52 +677,62 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
          */
         V remove(Object key, int hash, Object value)
         {
-            lock();
+            Lock outerLock = readLock();
+            outerLock.lock();
             try
             {
-                int c = count - 1;
-                HashEntry<K, V>[] tab = table;
-                int index = hash & (tab.length - 1);
-                HashEntry<K, V> first = tab[index];
-                HashEntry<K, V> e = first;
-                while (e != null && (e.hash != hash || !key.equals(e.key)))
+                Lock innerLock = lockFor(hash);
+                innerLock.lock();
+                try
                 {
-                    e = e.next;
-                }
-
-                V oldValue = null;
-                if (e != null)
-                {
-                    V v = e.value;
-                    if (value == null || value.equals(v))
+                    int c = count - 1;
+                    HashEntry<K, V>[] tab = table;
+                    int index = hash & (tab.length - 1);
+                    HashEntry<K, V> first = tab[index];
+                    HashEntry<K, V> e = first;
+                    while (e != null && (e.hash != hash || !key.equals(e.key)))
                     {
-                        oldValue = v;
-                        // All entries following removed node can stay
-                        // in list, but all preceding ones need to be
-                        // cloned.
-                        ++modCount;
-                        HashEntry<K, V> newFirst = e.next;
-                        for (HashEntry<K, V> p = first; p != e; p = p.next)
-                        {
-                            newFirst = new HashEntry<K, V>(p.key, p.hash,
-                                    newFirst, p.value);
-                        }
-                        tab[index] = newFirst;
-                        count = c; // write-volatile
+                        e = e.next;
                     }
+
+                    V oldValue = null;
+                    if (e != null)
+                    {
+                        V v = e.value;
+                        if (value == null || value.equals(v))
+                        {
+                            oldValue = v;
+                            // All entries following removed node can stay
+                            // in list, but all preceding ones need to be
+                            // cloned.
+                            ++modCount;
+                            HashEntry<K, V> newFirst = e.next;
+                            for (HashEntry<K, V> p = first; p != e; p = p.next)
+                            {
+                                newFirst = new HashEntry<K, V>(p.key, p.hash,
+                                        newFirst, p.value);
+                            }
+                            tab[index] = newFirst;
+                            count = c; // write-volatile
+                        }
+                    }
+                    return oldValue;
+                } finally
+                {
+                    innerLock.unlock();
                 }
-                return oldValue;
             } finally
             {
-                unlock();
+                outerLock.unlock();
             }
         }
 
         void clear()
         {
-            if (count != 0)
+            if (externalCount.get() != 0)
             {
-                lock();
+                Lock outerLock = writeLock();
+                outerLock.lock();
                 try
                 {
                     HashEntry<K, V>[] tab = table;
@@ -636,14 +741,67 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
                         tab[i] = null;
                     }
                     ++modCount;
-                    count = 0; // write-volatile
+                    externalCount.set(0);
+                    internalCount.set(0);
                 } finally
                 {
-                    unlock();
+                    outerLock.unlock();
                 }
             }
         }
-    }
+
+        public void removeHash(int hash)
+        {
+            Lock outerLock = readLock();
+            try
+            {
+                Lock innerLock = lockFor(hash);
+                innerLock.lock();
+                try
+                {
+                    int c = count - 1;
+                    HashEntry<K, V>[] tab = table;
+                    int index = hash & (tab.length - 1);
+                    HashEntry<K, V> first = tab[index];
+                    HashEntry<K, V> e = first;
+                    HashEntry<K, V> lastE = null;
+                    for (e = first; e != null; e = e.next)
+                    {
+                        if (e.hash == hash)
+                        {
+                            lastE = e;
+                        }
+                    }
+                    if (lastE == null)
+                    {
+                        // not found
+                        return;
+                    }
+                    e = lastE;
+                    ++modCount;
+                    HashEntry<K, V> newFirst = e.next;
+                    assert (newFirst == null || newFirst.hash != hash);
+                    for (HashEntry<K, V> p = first; p != e; p = p.next)
+                    {
+                        if (p.hash != hash)
+                        {
+                            newFirst = new HashEntry<K, V>(p.key, p.hash,
+                                    newFirst, p.value);
+                        }
+                    }
+                    tab[index] = newFirst;
+                    count = c; // write-volatile
+                } finally
+                {
+                    innerLock.unlock();
+                }
+            } finally
+            {
+                outerLock.unlock();
+            }
+        }
+
+    } // end Segment
 
     public void evict(HashEntry<K, V> max)
     {
@@ -718,7 +876,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
 
         for (int i = 0; i < this.segments.length; ++i)
         {
-            this.segments[i] = new Segment<K, V>(cap, loadFactor, maxSize / this.segments.length);
+            this.segments[i] = new Segment(cap, loadFactor, maxSize / this.segments.length);
         }
     }
 
@@ -786,40 +944,11 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public boolean isEmpty()
     {
-        final Segment<K, V>[] segments = this.segments;
-        /*
-         * We keep track of per-segment modCounts to avoid ABA
-         * problems in which an element in one segment was added and
-         * in another removed during traversal, in which case the
-         * table was never actually empty at any point. Note the
-         * similar use of modCounts in the size() and containsValue()
-         * methods, which are the only other methods also susceptible
-         * to ABA problems.
-         */
-        int[] mc = new int[segments.length];
-        int mcsum = 0;
-        for (int i = 0; i < segments.length; ++i)
+        for (Segment s : this.segments)
         {
-            if (segments[i].count != 0)
+            if (s.externalCount.get() != 0)
             {
                 return false;
-            } else
-            {
-                mcsum += mc[i] = segments[i].modCount;
-            }
-        }
-        // If mcsum happens to be zero, then we know we got a snapshot
-        // before any modifications at all were made.  This is
-        // probably common enough to bother tracking.
-        if (mcsum != 0)
-        {
-            for (int i = 0; i < segments.length; ++i)
-            {
-                if (segments[i].count != 0 ||
-                        mc[i] != segments[i].modCount)
-                {
-                    return false;
-                }
             }
         }
         return true;
@@ -835,7 +964,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         int sum = 0;
         for (Segment s : segments)
         {
-            sum += s.count;
+            sum += s.externalCount.get();
         }
         return sum;
     }
@@ -849,62 +978,12 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public int size()
     {
-        final Segment<K, V>[] segments = this.segments;
-        long sum = 0;
-        long check = 0;
-        int[] mc = new int[segments.length];
-        // Try a few times to get accurate count. On failure due to
-        // continuous async changes in table, resort to locking.
-        for (int k = 0; k < RETRIES_BEFORE_LOCK; ++k)
+        int sum = 0;
+        for (Segment s : this.segments)
         {
-            check = 0;
-            sum = 0;
-            int mcsum = 0;
-            for (int i = 0; i < segments.length; ++i)
-            {
-                sum += segments[i].count;
-                mcsum += mc[i] = segments[i].modCount;
-            }
-            if (mcsum != 0)
-            {
-                for (int i = 0; i < segments.length; ++i)
-                {
-                    check += segments[i].count;
-                    if (mc[i] != segments[i].modCount)
-                    {
-                        check = -1; // force retry
-                        break;
-                    }
-                }
-            }
-            if (check == sum)
-            {
-                break;
-            }
+            sum += s.externalCount.get();
         }
-        if (check != sum)
-        { // Resort to locking all segments
-            sum = 0;
-            for (int i = 0; i < segments.length; ++i)
-            {
-                segments[i].lock();
-            }
-            for (int i = 0; i < segments.length; ++i)
-            {
-                sum += segments[i].count;
-            }
-            for (int i = 0; i < segments.length; ++i)
-            {
-                segments[i].unlock();
-            }
-        }
-        if (sum > Integer.MAX_VALUE)
-        {
-            return Integer.MAX_VALUE;
-        } else
-        {
-            return (int) sum;
-        }
+        return sum;
     }
 
     /**
@@ -940,109 +1019,13 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public boolean containsKey(Object key)
     {
-        int hash = hash(key.hashCode());
+        return containsKey(key, key.hashCode());
+    }
+
+    public boolean containsKey(Object key, int hash)
+    {
+        hash = hash(hash);
         return segmentFor(hash).containsKey(key, hash);
-    }
-
-    /**
-     * Returns <tt>true</tt> if this map maps one or more keys to the
-     * specified value. Note: This method requires a full internal
-     * traversal of the hash table, and so is much slower than
-     * method <tt>containsKey</tt>.
-     *
-     * @param value value whose presence in this map is to be tested
-     * @return <tt>true</tt> if this map maps one or more keys to the
-     *         specified value
-     * @throws NullPointerException if the specified value is null
-     */
-    public boolean containsValue(Object value)
-    {
-        if (value == null)
-        {
-            throw new NullPointerException();
-        }
-
-        // See explanation of modCount use above
-
-        final Segment<K, V>[] segments = this.segments;
-        int[] mc = new int[segments.length];
-
-        // Try a few times without locking
-        for (int k = 0; k < RETRIES_BEFORE_LOCK; ++k)
-        {
-            int sum = 0;
-            int mcsum = 0;
-            for (int i = 0; i < segments.length; ++i)
-            {
-                int c = segments[i].count;
-                mcsum += mc[i] = segments[i].modCount;
-                if (segments[i].containsValue(value))
-                {
-                    return true;
-                }
-            }
-            boolean cleanSweep = true;
-            if (mcsum != 0)
-            {
-                for (int i = 0; i < segments.length; ++i)
-                {
-                    int c = segments[i].count;
-                    if (mc[i] != segments[i].modCount)
-                    {
-                        cleanSweep = false;
-                        break;
-                    }
-                }
-            }
-            if (cleanSweep)
-            {
-                return false;
-            }
-        }
-        // Resort to locking all segments
-        for (int i = 0; i < segments.length; ++i)
-        {
-            segments[i].lock();
-        }
-        boolean found = false;
-        try
-        {
-            for (int i = 0; i < segments.length; ++i)
-            {
-                if (segments[i].containsValue(value))
-                {
-                    found = true;
-                    break;
-                }
-            }
-        } finally
-        {
-            for (int i = 0; i < segments.length; ++i)
-            {
-                segments[i].unlock();
-            }
-        }
-        return found;
-    }
-
-    /**
-     * Legacy method testing if some key maps into the specified value
-     * in this table.  This method is identical in functionality to
-     * {@link #containsValue}, and exists solely to ensure
-     * full compatibility with class {@link java.util.Hashtable},
-     * which supported this method prior to introduction of the
-     * Java Collections framework.
-     *
-     * @param value a value to search for
-     * @return <tt>true</tt> if and only if some key maps to the
-     *         <tt>value</tt> argument in this table as
-     *         determined by the <tt>equals</tt> method;
-     *         <tt>false</tt> otherwise
-     * @throws NullPointerException if the specified value is null
-     */
-    public boolean contains(Object value)
-    {
-        return containsValue(value);
     }
 
     /**
@@ -1060,11 +1043,15 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public V put(K key, V value)
     {
+        return put(key, key.hashCode(), value);
+    }
+    public V put(K key, int hash, V value)
+    {
         if (value == null)
         {
             throw new NullPointerException();
         }
-        int hash = hash(key.hashCode());
+        hash = hash(hash);
         return segmentFor(hash).put(key, hash, value, false);
     }
 
@@ -1077,11 +1064,15 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public V putIfAbsent(K key, V value)
     {
+        return putIfAbsent(key, key.hashCode(), value);
+    }
+    public V putIfAbsent(K key, int hash, V value)
+    {
         if (value == null)
         {
             throw new NullPointerException();
         }
-        int hash = hash(key.hashCode());
+        hash = hash(hash);
         return segmentFor(hash).put(key, hash, value, true);
     }
 
@@ -1111,9 +1102,20 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public V remove(Object key)
     {
-        int hash = hash(key.hashCode());
+        return remove(key, key.hashCode());
+    }
+    public V remove(Object key, int hash)
+    {
+        hash = hash(hash);
         return segmentFor(hash).remove(key, hash, null);
     }
+
+    public void removeHash(int keyHash)
+    {
+        int hash = hash(keyHash);
+        segmentFor(hash).removeHash(hash);
+    }
+
 
     /**
      * {@inheritDoc}
@@ -1122,11 +1124,15 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public boolean remove(Object key, Object value)
     {
-        int hash = hash(key.hashCode());
+        return remove(key, key.hashCode(), value);
+    }
+    public boolean remove(Object key, int hash, Object value)
+    {
         if (value == null)
         {
             return false;
         }
+        hash = hash(hash);
         return segmentFor(hash).remove(key, hash, value) != null;
     }
 
@@ -1137,11 +1143,15 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
      */
     public boolean replace(K key, V oldValue, V newValue)
     {
+        return replace(key, key.hashCode(), oldValue, newValue)
+    }
+    public boolean replace(K key, int hash, V oldValue, V newValue)
+    {
         if (oldValue == null || newValue == null)
         {
             throw new NullPointerException();
         }
-        int hash = hash(key.hashCode());
+        hash = hash(hash);
         return segmentFor(hash).replace(key, hash, oldValue, newValue);
     }
 
@@ -1301,7 +1311,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
             while (nextSegmentIndex >= 0)
             {
                 Segment<K, V> seg = segments[nextSegmentIndex--];
-                if (seg.count != 0)
+                if (seg.externalCount.get() != 0)
                 {
                     currentTable = seg.table;
                     for (int j = currentTable.length - 1; j >= 0; --j)
@@ -1341,7 +1351,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
             SpecialMap.this.remove(lastReturned.key);
             lastReturned = null;
         }
-    }
+    } // end class HashIterator
 
     final class KeyIterator
             extends HashIterator
@@ -1356,7 +1366,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         {
             return super.nextEntry().key;
         }
-    }
+    } // end class KeyIterator
 
     final class ValueIterator
             extends HashIterator
@@ -1371,7 +1381,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         {
             return super.nextEntry().value;
         }
-    }
+    } // end class ValueIterator
 
     /**
      * Custom Entry class used by EntryIterator.next(), that relays
@@ -1443,7 +1453,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         {
             SpecialMap.this.clear();
         }
-    }
+    } // end class KeySet
 
     final class Values extends AbstractCollection<V>
     {
@@ -1466,7 +1476,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         {
             SpecialMap.this.clear();
         }
-    }
+    } // end class Values
 
     final class EntrySet extends AbstractSet<Map.Entry<K, V>>
     {
@@ -1505,7 +1515,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         {
             SpecialMap.this.clear();
         }
-    }
+    } // End class EntrySet
 
     /* ---------------- Serialization Support -------------- */
 
@@ -1525,7 +1535,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
         for (int k = 0; k < segments.length; ++k)
         {
             Segment<K, V> seg = segments[k];
-            seg.lock();
+            seg.writeLock().lock();
             try
             {
                 HashEntry<K, V>[] tab = seg.table;
@@ -1539,7 +1549,7 @@ public class SpecialMap<K, V extends Element> extends AbstractMap<K, V>
                 }
             } finally
             {
-                seg.unlock();
+                seg.writeLock().unlock();
             }
         }
         s.writeObject(null);

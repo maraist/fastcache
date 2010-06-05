@@ -2,7 +2,6 @@ package org.mlm.fastcache.util;
 
 import org.mlm.fastcache.Cache;
 import org.mlm.fastcache.Element;
-import org.mlm.fastcache.ElementImpl;
 
 /**
  * Date: May 8, 2010
@@ -27,7 +26,7 @@ public class AutoCreateCache<K,V> implements Cache<K,V>
         {
             return res;
         }
-        return locker.execute(key, key, new LockerCallback<K,Element<K,V>>() {
+        return locker.execute(key, key, new LockerCallback<K, Element<K,V>>() {
             @Override
             public Element<K,V> execute(K key)
             {
@@ -37,7 +36,7 @@ public class AutoCreateCache<K,V> implements Cache<K,V>
                     return res;
                 }
                  V val = factory.create(key);
-                Element<K,V> el = new ElementImpl<K,V>(key, val, System.currentTimeMillis());
+                Element<K,V> el = new Element<K,V>(key, val, System.currentTimeMillis());
                 cache.put(el);
                 return el;
             }

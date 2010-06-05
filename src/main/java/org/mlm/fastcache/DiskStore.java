@@ -17,7 +17,7 @@ public class DiskStore<K,V>
     final SpecialMap<K, Element<K,V>> smallMap;
 
     final SpecialMap<K, DiskRecord> diskMap;
-    final ConcurrentHashMap<K,Element<K,V>> enqueueMap;
+    final ConcurrentHashMap<K, Element<K,V>> enqueueMap;
 
     final DiskRecord maxRecord = new DiskRecord(0, 0, Integer.MAX_VALUE, 0);
     private int maxRecords;
